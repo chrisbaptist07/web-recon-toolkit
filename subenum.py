@@ -25,6 +25,7 @@ import html
 import json
 import math
 import random
+import re
 import socket
 import string
 import sys
@@ -34,6 +35,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     import dns.exception
@@ -190,14 +194,26 @@ def root_records(domain):
     return rec
 
 
-def detect_wildcard(domain):
-    ips = set()
-    for _ in range(3):
+def detect_wildcard(domain, probes=8):
+    """Probe random labels. Returns (ips, cnames): the pool of addresses and the
+    final CNAME targets a wildcard record answers with. Several probes are used
+    because round-robin / load-balanced wildcards rotate their answers."""
+    ips, cnames = set(), set()
+    for _ in range(probes):
         label = "".join(random.choices(string.ascii_lowercase, k=16))
         r = resolve_host(f"{label}.{domain}")
-        if r["status"] == "resolved":
+        if r["status"] == "resolved" or r["cnames"]:
             ips.update(r["ips"])
-    return ips
+            if r["cnames"]:
+                cnames.add(r["cnames"][-1])
+    return ips, cnames
+
+
+def matches_wildcard(rec, w_ips, w_cnames):
+    """True if a brute-force result is indistinguishable from the wildcard."""
+    if w_cnames:  # wildcard is a CNAME: same final target => same wildcard
+        return bool(rec["cnames"]) and rec["cnames"][-1] in w_cnames
+    return bool(set(rec["ips"]) & w_ips)  # any overlap with the rotating pool
 
 
 # --------------------------------------------------------------------------
@@ -229,6 +245,39 @@ def interest_tags(host, domain):
     return sorted(set(tags))
 
 
+def probe_http(host, timeout=6.0):
+    """GET / over https, then http. Returns a small dict, or None if nothing answers.
+    Redirects are not followed so the first response is what gets recorded."""
+    for scheme in ("https", "http"):
+        try:
+            r = requests.get(f"{scheme}://{host}/", timeout=timeout, allow_redirects=False,
+                             verify=False, stream=True, headers={"User-Agent": "subenum/1.0"})
+        except requests.RequestException:
+            continue
+        try:
+            body = next(r.iter_content(65536), b"")
+        except Exception:
+            body = b""
+        finally:
+            r.close()
+        m = re.search(r"<title[^>]*>(.*?)</title>", body.decode("utf-8", "ignore"), re.I | re.S)
+        loc = r.headers.get("Location", "")
+        return {"scheme": scheme, "status": r.status_code, "length": len(body),
+                "title": " ".join(m.group(1).split())[:80] if m else "",
+                "server": r.headers.get("Server", ""), "location": loc,
+                "loc_sig": loc.replace(host, "@")}
+    return None
+
+
+def same_page(a, b):
+    """True if two probe results look like the same page (used for wildcard detection)."""
+    if not a or not b:
+        return False
+    if a["status"] != b["status"] or a["title"] != b["title"] or a["loc_sig"] != b["loc_sig"]:
+        return False
+    return abs(a["length"] - b["length"]) <= max(20, int(max(a["length"], b["length"]) * 0.03))
+
+
 def group_key(rec):
     """Cluster hosts by where they are hosted: CNAME provider, else IP /24."""
     if rec["cnames"]:
@@ -242,7 +291,7 @@ def group_key(rec):
     return "unresolved"
 
 
-def enumerate_domain(domain, wordlist=None, threads=40, use_crt=True, quiet=False):
+def enumerate_domain(domain, wordlist=None, threads=40, use_crt=True, quiet=False, probe=False):
     log = (lambda *a: None) if quiet else (lambda *a: print(*a, file=sys.stderr))
     hosts = {}  # name -> {"sources": set, "first_seen":..., "issuers": []}
 
@@ -253,12 +302,14 @@ def enumerate_domain(domain, wordlist=None, threads=40, use_crt=True, quiet=Fals
                            "issuers": sorted(meta["issuers"])}
         log(f"    {len(hosts)} unique names from certificate transparency")
 
-    wildcard_ips = set()
+    wildcard_ips, wildcard_cnames, dropped = set(), set(), 0
     if wordlist:
-        wildcard_ips = detect_wildcard(domain)
-        if wildcard_ips:
-            log(f"[!] Wildcard DNS detected ({', '.join(sorted(wildcard_ips))}); "
-                "brute-force hits resolving only there will be dropped")
+        wildcard_ips, wildcard_cnames = detect_wildcard(domain)
+        if wildcard_ips or wildcard_cnames:
+            via = f" via CNAME {', '.join(sorted(wildcard_cnames))}" if wildcard_cnames else ""
+            how = ("each will be compared with the wildcard's HTTP response" if probe
+                   else "brute-force hits matching it will be dropped")
+            log(f"[!] Wildcard DNS detected{via} ({len(wildcard_ips)} addresses in pool); {how}")
         for w in wordlist:
             w = w.strip().lower()
             if w and not w.startswith("#"):
@@ -279,8 +330,12 @@ def enumerate_domain(domain, wordlist=None, threads=40, use_crt=True, quiet=Fals
             only_brute = meta["sources"] == {"brute"}
             if only_brute and rec["status"] in ("nxdomain", "unresolved"):
                 continue
-            if only_brute and wildcard_ips and set(rec["ips"]) <= wildcard_ips and not rec["cnames"]:
-                continue
+            if only_brute and (wildcard_ips or wildcard_cnames) \
+                    and matches_wildcard(rec, wildcard_ips, wildcard_cnames):
+                if not probe:
+                    dropped += 1
+                    continue
+                rec["wildcard_dns"] = True  # decide after the HTTP comparison
             rec.update(host=h, sources=sorted(meta["sources"]), first_seen=meta["first_seen"],
                        issuers=meta["issuers"], tags=interest_tags(h, domain),
                        takeover=takeover_hint(rec))
@@ -291,12 +346,39 @@ def enumerate_domain(domain, wordlist=None, threads=40, use_crt=True, quiet=Fals
                 sys.stderr.write(f"\r    {done} kept so far...")
     if not quiet:
         sys.stderr.write("\r" + " " * 40 + "\r")
+    if probe:
+        wild_sig = None
+        if wildcard_ips or wildcard_cnames:
+            for _ in range(3):
+                label = "".join(random.choices(string.ascii_lowercase, k=16))
+                wild_sig = probe_http(f"{label}.{domain}")
+                if wild_sig:
+                    break
+        live = [r for r in results if r["status"] == "resolved"]
+        log(f"[*] Probing {len(live)} resolving hosts over HTTP(S) ...")
+        with ThreadPoolExecutor(max_workers=min(threads, 30)) as ex:
+            for r, res in zip(live, ex.map(lambda r: probe_http(r["host"]), live)):
+                r["http"] = res
+        kept = []
+        for r in results:
+            if r.pop("wildcard_dns", False) and (r.get("http") is None or same_page(r["http"], wild_sig)):
+                dropped += 1
+                continue
+            kept.append(r)
+        results = kept
+    for r in results:
+        r.setdefault("http", None)
+        r.pop("wildcard_dns", None)
+    if dropped:
+        log(f"[*] Dropped {dropped} brute-force candidates that matched the wildcard")
     results.sort(key=lambda r: (r["group"], r["host"]))
     return {
         "domain": domain,
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "resolver": "dnspython" if HAVE_DNS else "stdlib",
         "wildcard_ips": sorted(wildcard_ips),
+        "wildcard_cnames": sorted(wildcard_cnames),
+        "probed": probe,
         "apex_records": root_records(domain),
         "hosts": results,
     }
@@ -347,6 +429,8 @@ def build_map(data, size=1000):
             cls = node_class(h)
             edges.append(f'<line class="e1" x1="{gx:.1f}" y1="{gy:.1f}" x2="{x:.1f}" y2="{y:.1f}"/>')
             tip = f"{h['host']} - {', '.join(h['ips'][:3]) or h['status']}"
+            if h.get("http"):
+                tip += f" - HTTP {h['http']['status']}"
             if h["takeover"]:
                 tip += f" - {h['takeover']}"
             nodes.append(f'<circle class="n {cls}" data-host="{html.escape(h["host"])}" '
@@ -408,7 +492,7 @@ input[type=search]{flex:1;padding:8px 10px;border:1px solid var(--line);border-r
 table{border-collapse:collapse;width:100%;font-size:13px}
 th{position:sticky;top:0;background:var(--panel);text-align:left;color:var(--mute);font-weight:600;padding:6px 8px;border-bottom:1px solid var(--line)}
 td{padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top;word-break:break-word}
-td.nw{white-space:nowrap}td.h{font-family:ui-monospace,Menlo,Consolas,monospace}
+td.nw{white-space:nowrap}.st2{color:var(--live)}.st3{color:var(--hot)}.st4{color:var(--hot)}.st5{color:var(--risk)}.ttl{color:var(--mute);display:block;max-width:220px;overflow:hidden;text-overflow:ellipsis}td.h{font-family:ui-monospace,Menlo,Consolas,monospace}
 tr.sel td{background:color-mix(in srgb,var(--hot) 14%,transparent)}
 .pill{display:inline-block;white-space:nowrap;padding:0 7px;border-radius:9px;font-size:11.5px;border:1px solid var(--line);margin:0 4px 2px 0;color:var(--mute)}
 .pill.risk{color:var(--risk);border-color:var(--risk)}
@@ -434,9 +518,19 @@ def render_html(data):
     hosts = data["hosts"]
     n_live = sum(1 for h in hosts if h["status"] == "resolved")
     n_hot = sum(1 for h in hosts if h["tags"])
+    n_http = sum(1 for h in hosts if h.get("http"))
     n_risk = sum(1 for h in hosts if h["takeover"])
     n_groups = len({h["group"] for h in hosts})
     n_ips = len({ip for h in hosts for ip in h["ips"]})
+
+    def http_cell(h):
+        x = h.get("http")
+        if not x:
+            return '<td class="nw">-</td>'
+        title = f'<span class="ttl">{html.escape(x["title"])}</span>' if x["title"] else ""
+        loc = f'<span class="ttl">→ {html.escape(x["location"][:60])}</span>' if x["location"] else ""
+        return (f'<td class="nw"><b class="st{x["status"] // 100}">{x["status"]}</b> '
+                f'{x["scheme"]}{title}{loc}</td>')
 
     rows = []
     for h in hosts:
@@ -447,7 +541,7 @@ def render_html(data):
         note = f'<div class="note">{html.escape(h["takeover"])}</div>' if h["takeover"] else ""
         rows.append(
             f'<tr data-host="{html.escape(h["host"])}"><td class="h">{html.escape(h["host"])}{note}</td>'
-            f'<td class="nw">{html.escape(h["status"])}</td>'
+            f'<td class="nw">{html.escape(h["status"])}</td>{http_cell(h)}'
             f'<td class="h nw">{html.escape(", ".join(h["ips"][:2]) or "-")}'
             f'{"<br>" + html.escape(chain) if chain else ""}</td>'
             f'<td>{pills}</td><td>{html.escape(", ".join(h["sources"]))}'
@@ -456,8 +550,9 @@ def render_html(data):
     apex = data["apex_records"]
     apex_html = "".join(f'<div>{k}: <code>{html.escape("  |  ".join(v))}</code></div>'
                         for k, v in apex.items() if v)
-    if data["wildcard_ips"]:
-        apex_html += f'<div>Wildcard DNS: <code>{html.escape(", ".join(data["wildcard_ips"]))}</code></div>'
+    if data["wildcard_ips"] or data.get("wildcard_cnames"):
+        wc = list(data.get("wildcard_cnames", [])) + data["wildcard_ips"]
+        apex_html += f'<div>Wildcard DNS: <code>{html.escape(", ".join(wc))}</code></div>'
 
     page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -467,6 +562,7 @@ def render_html(data):
 <div class="stats">
 <div><b>{len(hosts)}</b><span>hostnames</span></div><div><b>{n_live}</b><span>resolving</span></div>
 <div><b>{n_ips}</b><span>unique IPs</span></div><div><b>{n_groups}</b><span>hosting groups</span></div>
+{f'<div><b>{n_http}</b><span>answering HTTP</span></div>' if data.get("probed") else ""}
 <div><b>{n_hot}</b><span>high-interest</span></div><div><b>{n_risk}</b><span>dangling CNAME</span></div></div>
 <main>
 <div class="card">{build_map(data)}
@@ -476,7 +572,7 @@ def render_html(data):
 <span><i style="background:var(--dead)"></i>not resolving</span>
 <span>Inner boxes: hosting group (CNAME provider or IP block)</span></div></div>
 <div class="card"><div class="tools"><input id="q" type="search" placeholder="Filter hostnames, IPs, tags..."></div>
-<div class="tbl"><table id="t"><thead><tr><th>Host</th><th>DNS</th><th>Address / CNAME</th><th>Tags</th><th>Source</th></tr></thead>
+<div class="tbl"><table id="t"><thead><tr><th>Host</th><th>DNS</th><th>HTTP</th><th>Address / CNAME</th><th>Tags</th><th>Source</th></tr></thead>
 <tbody>{"".join(rows)}</tbody></table></div></div></main>
 <section class="apex">{apex_html}</section>
 <script>{REPORT_JS}</script></body></html>"""
@@ -497,6 +593,9 @@ def main():
                     help="Custom DNS resolver IP (repeatable, requires dnspython)")
     ap.add_argument("--timeout", type=float, default=4.0, help="DNS timeout in seconds")
     ap.add_argument("--no-crt", action="store_true", help="Skip crt.sh")
+    ap.add_argument("--probe", action="store_true",
+                    help="Also send GET / over HTTPS/HTTP to each live host (status, title, redirect). "
+                         "Sends traffic to the target. Also fixes wildcard false positives")
     ap.add_argument("-o", "--output", help="Output prefix (writes PREFIX.json and PREFIX.html)")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args()
@@ -515,12 +614,14 @@ def main():
               "detection). pip install dnspython", file=sys.stderr)
     get_resolver(args.resolver, args.timeout)
 
-    data = enumerate_domain(domain, words, args.threads, not args.no_crt, args.quiet)
+    data = enumerate_domain(domain, words, args.threads, not args.no_crt, args.quiet, args.probe)
 
     for h in data["hosts"]:
         flag = "!" if h["takeover"] else ("*" if h["tags"] else " ")
-        addr = ", ".join(h["ips"][:2]) or h["status"]
-        print(f"{flag} {h['host']:<45} {addr}")
+        addr = ", ".join(h["ips"][:1]) or h["status"]
+        x = h.get("http")
+        web = f"{x['status']} {x['title'][:40]}" if x else ""
+        print(f"{flag} {h['host']:<45} {addr:<40} {web}".rstrip())
     if not args.quiet:
         print(f"\n[*] {len(data['hosts'])} hosts ({sum(1 for h in data['hosts'] if h['takeover'])} "
               "dangling CNAMEs)", file=sys.stderr)

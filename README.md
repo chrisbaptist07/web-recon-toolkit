@@ -48,10 +48,14 @@ python dirscan.py https://target.example -w wordlists/dirs.txt -x php,bak -t 30 
 ```bash
 python subenum.py example.com -w wordlists/subdomains.txt -t 50 -o example
 # -> example.json, example.html
+
+python subenum.py example.com -w wordlists/subdomains.txt --probe -o example
+# also fetches / on every live host: HTTP status, title, redirect target
 ```
 
 - Pulls names from **crt.sh**, optionally adds DNS brute force (`-w`), resolves A/AAAA/CNAME.
-- Detects **wildcard DNS** and discards brute-force false positives.
+- Detects **wildcard DNS** (including round-robin and CNAME wildcards) and discards brute-force false positives.
+- With **`--probe`**, sends `GET /` over HTTPS then HTTP to each live host and records status code, page title, server header and redirect target. Brute-force hits whose response is identical to a random non-existent subdomain are treated as wildcard noise, which separates real virtual hosts from catch-alls even when DNS can't. This sends traffic to the target, so it is opt-in.
 - Flags **dangling CNAMEs** to takeover-prone services. These are *candidates* to verify manually, not confirmed takeovers.
 - Tags high-interest names (`admin`, `staging`, `vpn`, `jenkins`, ...).
 - The HTML report is self-contained (no external assets) with a radial map grouped by hosting provider / IP block, plus a filterable table. See [`examples/`](examples/) (invented data).
@@ -69,7 +73,7 @@ Tests use mocked DNS and crt.sh data, so they run offline.
 
 ## Limitations / ideas
 
-- No recursion in `dirscan`; no HTTP probing of discovered subdomains yet.
+- No recursion in `dirscan`; `subenum --probe` checks only `/` on ports 80/443 (no port scanning).
 - Only crt.sh as a passive source. More (VirusTotal, SecurityTrails, ...) would improve coverage.
 - Threads rather than asyncio. `httpx.AsyncClient` would scale further.
 
