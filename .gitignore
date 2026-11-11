@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+# scan output - never commit results from real targets
+*.json
+!examples/*.json
+results/
+out/
